@@ -530,16 +530,18 @@ int parasite_dump_pages_seized(struct pstree_item *item,
 	 * Afterwards -- reprotect memory back.
 	 */
 
-	pargs->add_prot = PROT_READ;
-	ret = compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl);
-	if (ret) {
-		pr_err("Can't dump unprotect vmas with parasite\n");
-		return ret;
-	}
+	if (!mdc->pre_dump) {
+		pargs->add_prot = PROT_READ;
+		ret = compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl);
+		if (ret) {
+			pr_err("Can't dump unprotect vmas with parasite\n");
+			return ret;
+		}
 
-	if (fault_injected(FI_DUMP_PAGES)) {
-		pr_err("fault: Dump VMA pages failure!\n");
-		return -1;
+		if (fault_injected(FI_DUMP_PAGES)) {
+			pr_err("fault: Dump VMA pages failure!\n");
+			return -1;
+		}
 	}
 
 	ret = __parasite_dump_pages_seized(item, pargs, vma_area_list, mdc, ctl);
@@ -549,10 +551,12 @@ int parasite_dump_pages_seized(struct pstree_item *item,
 		return ret;
 	}
 
-	pargs->add_prot = 0;
-	if (compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
-		pr_err("Can't rollback unprotected vmas with parasite\n");
-		ret = -1;
+	if (!mdc->pre_dump) {
+		pargs->add_prot = 0;
+		if (compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
+			pr_err("Can't rollback unprotected vmas with parasite\n");
+			ret = -1;
+		}
 	}
 
 	return ret;
