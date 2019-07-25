@@ -33,7 +33,7 @@ static int __ppb_resize_pipe(struct page_pipe_buf *ppb, unsigned long new_size)
 {
 	int ret;
 
-	ret = fcntl(ppb->p[0], F_SETPIPE_SZ, new_size * PAGE_SIZE);
+	ret = fcntl(ppb->p[0], F_SETPIPE_SZ, new_size * PAGE_SIZE + 1);
 	if (ret < 0)
 		return -1;
 
@@ -41,7 +41,7 @@ static int __ppb_resize_pipe(struct page_pipe_buf *ppb, unsigned long new_size)
 	BUG_ON(ret < ppb->pipe_size);
 
 	pr_debug("Grow pipe %x -> %x\n", ppb->pipe_size, ret);
-	ppb->pipe_size = ret;
+	ppb->pipe_size = ret -1;
 
 	return 0;
 }
