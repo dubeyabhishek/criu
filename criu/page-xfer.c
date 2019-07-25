@@ -499,16 +499,190 @@ static inline u32 ppb_xfer_flags(struct page_xfer *xfer, struct page_pipe_buf *p
 		return PE_PRESENT;
 }
 
+static char userbuf[4 << 20];
+
+ssize_t copy_to_userbuf(int pid, struct iovec* liov, struct iovec* riov, unsigned long riov_cnt)
+{
+	ssize_t ret;
+
+	ret = process_vm_readv(pid, liov, 1, riov, riov_cnt, 0);
+
+	/* Target process doesn't exist */
+	if (ret == -1 && errno == ESRCH) {
+		pr_err("Target process with PID %d not found\n", pid);
+		return -2;
+	}
+
+	return ret;
+}
+
+/*
+ * This function returns the index of that iov in an iovec, which failed to get
+ * processed by process_vm_readv or may be partially processed
+ */
+unsigned int faulty_iov_index(ssize_t bytes_read, struct iovec* riov, size_t index,
+		unsigned int riovcnt, unsigned long *iov_cntr, unsigned long *page_diff)
+{
+	ssize_t processed_bytes = 0;
+	*iov_cntr = 0;
+	*page_diff = 0;
+
+	while (processed_bytes < bytes_read && index < riovcnt) {
+
+		processed_bytes += riov[index].iov_len;
+		(*iov_cntr) += 1;
+		index += 1;
+	}
+
+	/* one iov is partially read */
+	if (bytes_read < processed_bytes) {
+		*page_diff = processed_bytes - bytes_read;
+		index -= 1;
+	}
+
+	return index;
+}
+
+long processing_ppb_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bufvec)
+{
+	struct iovec *riov = ppb->iov;
+	ssize_t bytes_read = 0;
+	unsigned long pro_iovs = 0, start = 0, iov_cntr = 0, end;
+	unsigned long pages_read = 0, pages_skipped = 0;
+	unsigned long page_diff = 0;
+
+	bufvec->iov_len = sizeof(userbuf);
+	bufvec->iov_base = userbuf;
+
+	while (pro_iovs < ppb->nr_segs)
+	{
+		bytes_read = copy_to_userbuf(pid, bufvec, &riov[start],
+							ppb->nr_segs - pro_iovs);
+
+		if (bytes_read == -2)
+			return -2;
+
+		if (bytes_read == -1)
+		{
+			/*
+			 *  In other errors, adjust page count and mark the page
+			 *  to be skipped by pagemap generation
+			 */
+
+			cnt_sub(CNT_PAGES_WRITTEN, riov[start].iov_len/PAGE_SIZE);
+			pages_skipped += riov[start].iov_len/PAGE_SIZE;
+			riov[start].iov_base = SKIP_PAGEMAP;
+
+			pro_iovs += 1;
+			start += 1;
+			continue;
+		}
+
+		pages_read += bytes_read/PAGE_SIZE;
+
+		if (pages_read + pages_skipped == ppb->pages_in)
+			break;
+
+		end = faulty_iov_index(bytes_read, riov,
+					start, ppb->nr_segs, &iov_cntr, &page_diff);
+
+		/*
+		 * One single iov could be partially read, unless unmapped page in
+		 * iov range is not hit by process_vm_readv, need to handle this
+		 * special case
+		 */
+
+		if (!page_diff)
+		{
+			cnt_sub(CNT_PAGES_WRITTEN, riov[end].iov_len/PAGE_SIZE);
+			pages_skipped += riov[end].iov_len/PAGE_SIZE;
+			riov[end].iov_base = SKIP_PAGEMAP;
+			start = end + 1;
+			pro_iovs += iov_cntr + 1;
+		}
+		else
+		{
+			riov[end].iov_len -= page_diff;
+			cnt_sub(CNT_PAGES_WRITTEN, page_diff/PAGE_SIZE);
+			pages_skipped += page_diff/PAGE_SIZE;
+			start = end + 1;
+			pro_iovs += iov_cntr;
+		}
+
+		bufvec->iov_base = userbuf + pages_read * PAGE_SIZE;
+		bufvec->iov_len -= bytes_read;
+	}
+
+	return pages_read;
+}
+
+
+int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *pp)
+{
+	struct page_pipe_buf *ppb;
+	unsigned int cur_hole = 0, i;
+	unsigned long ret, pages_read;
+	struct iovec bufvec;
+
+	list_for_each_entry(ppb, &pp->bufs, l) {
+
+		pages_read = processing_ppb_userbuf(pid, ppb, &bufvec);
+
+		if (pages_read == -1)
+			return -1;
+
+		bufvec.iov_base = userbuf;
+		bufvec.iov_len = pages_read * PAGE_SIZE;
+		ret = vmsplice(ppb->p[1], &bufvec, 1, SPLICE_F_NONBLOCK);
+
+		if (ret == -1 || ret != pages_read * PAGE_SIZE) {
+			pr_err("vmsplice: Failed to splice user buffer to pipe %ld\n", ret);
+			return -1;
+		}
+
+		/* generating pagemap */
+		for (i = 0; i < ppb->nr_segs; i++) {
+
+			if (ppb->iov[i].iov_base == SKIP_PAGEMAP)
+				continue;
+
+			struct iovec iov = ppb->iov[i];
+			u32 flags;
+
+			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
+			if (ret)
+				return ret;
+
+			BUG_ON(iov.iov_base < (void *)xfer->offset);
+			iov.iov_base -= xfer->offset;
+			pr_debug("\tp %p [%u]\n", iov.iov_base,
+					(unsigned int)(iov.iov_len / PAGE_SIZE));
+
+			flags = ppb_xfer_flags(xfer, ppb);
+
+			if (xfer->write_pagemap(xfer, &iov, flags))
+				return -1;
+			if ((flags & PE_PRESENT) && xfer->write_pages(xfer,
+						ppb->p[0], iov.iov_len))
+				return -1;
+
+		}
+
+	}
+
+	return dump_holes(xfer, pp, &cur_hole, NULL);
+}
+
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0;
+	unsigned int i;
 	int ret;
 
 	pr_debug("Transferring pages:\n");
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
-		unsigned int i;
 
 		pr_debug("\tbuf %d/%d\n", ppb->pages_in, ppb->nr_segs);
 
