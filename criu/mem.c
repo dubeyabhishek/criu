@@ -361,6 +361,12 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma,
 				!vma_area_is(vma, VMA_ANON_SHARED))
 		return 0;
 
+	if (!(vma->e->prot & PROT_READ)) {
+		if (pre_dump)
+			return 0;
+		has_parent = false;
+	}
+
 	if (vma_entry_is(vma->e, VMA_AREA_AIORING)) {
 		if (pre_dump)
 			return 0;
