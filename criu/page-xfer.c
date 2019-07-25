@@ -626,6 +626,7 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
 
+		timing_start(TIME_MEMDUMP);
 		pages_read = processing_ppb_userbuf(pid, ppb, &bufvec);
 
 		if (pages_read == -1)
@@ -640,6 +641,9 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 			return -1;
 		}
 
+		timing_stop(TIME_MEMDUMP);
+
+		timing_start(TIME_MEMWRITE);
 		/* generating pagemap */
 		for (i = 0; i < ppb->nr_segs; i++) {
 
@@ -668,7 +672,10 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 
 		}
 
+		timing_stop(TIME_MEMWRITE);
 	}
+
+	timing_start(TIME_MEMWRITE);
 
 	return dump_holes(xfer, pp, &cur_hole, NULL);
 }
