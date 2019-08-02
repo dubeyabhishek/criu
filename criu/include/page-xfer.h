@@ -11,6 +11,8 @@ extern int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd);
 
 /* to skip pagemap generation for skipped iovs */
 #define SKIP_PAGEMAP (void*)0xdeadbeef
+#define PR_UNAVIL -2
+#define ER_READ -1
 
 /*
  * page_xfer -- transfer pages into image file.

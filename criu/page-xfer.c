@@ -499,9 +499,9 @@ static inline u32 ppb_xfer_flags(struct page_xfer *xfer, struct page_pipe_buf *p
 		return PE_PRESENT;
 }
 
-static char userbuf[4 << 20];
+static char userbuf[512 << 12];
 
-ssize_t copy_to_userbuf(int pid, struct iovec* liov, struct iovec* riov, unsigned long riov_cnt)
+static ssize_t copy_to_userbuf(int pid, struct iovec* liov, struct iovec* riov, unsigned long riov_cnt)
 {
 	ssize_t ret;
 
@@ -509,8 +509,8 @@ ssize_t copy_to_userbuf(int pid, struct iovec* liov, struct iovec* riov, unsigne
 
 	/* Target process doesn't exist */
 	if (ret == -1 && errno == ESRCH) {
-		pr_err("Target process with PID %d not found\n", pid);
-		return -2;
+		pr_debug("Target process with PID %d not found\n", pid);
+		return PR_UNAVIL;
 	}
 
 	return ret;
@@ -520,7 +520,7 @@ ssize_t copy_to_userbuf(int pid, struct iovec* liov, struct iovec* riov, unsigne
  * This function returns the index of that iov in an iovec, which failed to get
  * processed by process_vm_readv or may be partially processed
  */
-unsigned int faulty_iov_index(ssize_t bytes_read, struct iovec* riov, size_t index,
+static unsigned int faulty_iov_index(ssize_t bytes_read, struct iovec* riov, size_t index,
 		unsigned int riovcnt, unsigned long *iov_cntr, unsigned long *page_diff)
 {
 	ssize_t processed_bytes = 0;
@@ -543,7 +543,7 @@ unsigned int faulty_iov_index(ssize_t bytes_read, struct iovec* riov, size_t ind
 	return index;
 }
 
-long processing_ppb_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bufvec)
+static long processing_ppb_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bufvec)
 {
 	struct iovec *riov = ppb->iov;
 	ssize_t bytes_read = 0;
@@ -554,16 +554,15 @@ long processing_ppb_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bu
 	bufvec->iov_len = sizeof(userbuf);
 	bufvec->iov_base = userbuf;
 
-	while (pro_iovs < ppb->nr_segs)
-	{
+	while (pro_iovs < ppb->nr_segs) {
+
 		bytes_read = copy_to_userbuf(pid, bufvec, &riov[start],
 							ppb->nr_segs - pro_iovs);
 
-		if (bytes_read == -2)
-			return -2;
+		if (bytes_read == PR_UNAVIL)
+			return PR_UNAVIL;
 
-		if (bytes_read == -1)
-		{
+		if (bytes_read == ER_READ) {
 			/*
 			 *  In other errors, adjust page count and mark the page
 			 *  to be skipped by pagemap generation
@@ -592,16 +591,13 @@ long processing_ppb_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bu
 		 * special case
 		 */
 
-		if (!page_diff)
-		{
+		if (!page_diff) {
 			cnt_sub(CNT_PAGES_WRITTEN, riov[end].iov_len/PAGE_SIZE);
 			pages_skipped += riov[end].iov_len/PAGE_SIZE;
 			riov[end].iov_base = SKIP_PAGEMAP;
 			start = end + 1;
 			pro_iovs += iov_cntr + 1;
-		}
-		else
-		{
+		} else {
 			riov[end].iov_len -= page_diff;
 			cnt_sub(CNT_PAGES_WRITTEN, page_diff/PAGE_SIZE);
 			pages_skipped += page_diff/PAGE_SIZE;
@@ -629,7 +625,7 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 		timing_start(TIME_MEMDUMP);
 		pages_read = processing_ppb_userbuf(pid, ppb, &bufvec);
 
-		if (pages_read == -1)
+		if (pages_read == ER_READ || pages_read == PR_UNAVIL)
 			return -1;
 
 		bufvec.iov_base = userbuf;
@@ -666,8 +662,7 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				return -1;
-			if ((flags & PE_PRESENT) && xfer->write_pages(xfer,
-						ppb->p[0], iov.iov_len))
+			if (xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
 				return -1;
 
 		}
@@ -684,12 +679,12 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0;
-	unsigned int i;
 	int ret;
 
 	pr_debug("Transferring pages:\n");
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
+		unsigned int i;
 
 		pr_debug("\tbuf %d/%d\n", ppb->pages_in, ppb->nr_segs);
 
