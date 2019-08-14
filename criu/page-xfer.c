@@ -499,140 +499,342 @@ static inline u32 ppb_xfer_flags(struct page_xfer *xfer, struct page_pipe_buf *p
 		return PE_PRESENT;
 }
 
+/*
+ * Optimizing pre-dump algorithm
+ * ==============================
+ *
+ * Note: Please refer man(2) page of process_vm_readv syscall.
+ *
+ * Following discussion covers the possible faulty-iov locations
+ * in an iovec, which hinders process_vm_readv to process
+ * complete iovec in one go.
+ *
+ * Memory layout of target process:
+ *
+ * Pages: A        B        C
+ * 	  +--------+--------+--------+--------+--------+--------+
+ * 	  |||||||||||||||||||||||||||||||||||||||||||||||||||||||
+ * 	  +--------+--------+--------+--------+--------+--------+
+ *
+ * Single "iov" representation: {starting_address, length_in_bytes}
+ * An iovec is array of iov-s.
+ *
+ * NOTE: For easy representation and discussion purpose,
+ *	 we carry out further discussion at "page granularity".
+ *       Length field is page count in that iov. Same assumption
+ *       applies for syscall return value, instead of bytes read,
+ *       it returns read page count.
+ *
+ * For above memory mapping, generated iovec: {A,1}{B,1}{C,4}
+ *
+ * This iovec remains unmodified once generated. At the same
+ * time some of memory regions listed in iovec may get modified
+ * (unmap/change protection) by the target process while syscall
+ * is trying to dump iovec regions.
+ *
+ * Case 1:
+ *	A is unmapped, {A,1} become faulty iov
+ *
+ *	A        B        C
+ * 	+--------+--------+--------+--------+--------+--------+
+ * 	|        ||||||||||||||||||||||||||||||||||||||||||||||
+ * 	+--------+--------+--------+--------+--------+--------+
+ * 	^        ^
+ * 	|        |
+ * 	start    |
+ *      (1)	 |
+ *               start
+ *               (2)
+ *
+ *      process_vm_readv will return -1. Increment start pointer(2),
+ *      syscall will process {B,1}{C,4} in one go and copy 5 pages
+ *      to userbuf from iov-B and iov-C.
+ *
+ * Case 2:
+ *      B is unmapped, {B,1} become faulty iov
+ *
+ *	A        B        C
+ * 	+--------+--------+--------+--------+--------+--------+
+ * 	|||||||||         |||||||||||||||||||||||||||||||||||||
+ * 	+--------+--------+--------+--------+--------+--------+
+ * 	^                 ^
+ * 	|                 |
+ * 	start             |
+ *      (1)               |
+ *                        start
+ *                        (2)
+ *
+ *      process_vm_readv will return 1, i.e. page A copied to
+ *      userbuf successfully and syscall stopped, since B got
+ *      unmapped.
+ *
+ *      Increment the start pointer to C(2) and invoke syscall.
+ *      Userbuf contains 5 pages overall from iov-A and iov-C.
+ *
+ *
+ * Case 3:
+ *	This case deals with partial unmapping of iov representing
+ *	more than one pagesize region.
+ *
+ *	Syscall can't process such faulty iov as whole. So we
+ *	process such regions part-by-part and form new sub-iovs
+ *	in aux_iov from successfully processed pages.
+ *
+ *
+ *	Part 3.1:
+ *		First page of C is unmapped
+ *
+ *	A        B        C
+ * 	+--------+--------+--------+--------+--------+--------+
+ * 	||||||||||||||||||         ||||||||||||||||||||||||||||
+ * 	+--------+--------+--------+--------+--------+--------+
+ * 	^                          ^
+ * 	|                          |
+ * 	start                      |
+ *      (1)	                   |
+ *				   dummy
+ *				   (2)
+ *
+ *	process_vm_readv will return 2, i.e. pages A and B copied.
+ *	We identify length of iov-C is more than 1 page, that is
+ *	where this case differs from Case 2.
+ *
+ *	dummy-iov is introduced(2) as: {C+1,3}. dummy-iov can be
+ *      directly placed at next page to failing page. This will copy
+ *	remaining 3 pages from iov-C to userbuf. Finally create
+ *	modified iov entry in aux_iov. Complete aux_iov look like:
+ *
+ *	aux_iov: {A,1}{B,1}{C+1,3}*
+ *
+ *
+ *	Part 3.2:
+ *		In between page of C is unmapped, let's say third
+ *
+ *
+ *	A        B        C
+ * 	+--------+--------+--------+--------+--------+--------+
+ * 	||||||||||||||||||||||||||||||||||||         ||||||||||
+ * 	+--------+--------+--------+--------+--------+--------+
+ * 	^                 			     ^
+ * 	|                 |-----------------|        |
+ * 	start              partial_read_bytes        |
+ *      (1)	                                     |
+ *			                             dummy
+ *			                             (2)
+ *
+ *	process_vm_readv will return 4, i.e. pages A and B copied
+ *      completely and first two pages of C are also copied.
+ *
+ *	Since, iov-C is not processed completely, we need to find
+ *	"partial_read_byte" count to place out dummy-iov for
+ *	remainig processing of iov-C. This function is performed by
+ *	analyze_iov function.
+ *
+ *	dummy-iov will be(2): {C+3,1}. dummy-iov will be placed
+ *      next to first failing address to process remaining iov-C.
+ *	New entries in aux_iov will look like:
+ *
+ *	aux_iov: {A,1}{B,1}{C,2}*{C+3,1}*
+ */
+
 static char userbuf[512 << 12];
 
-static ssize_t copy_to_userbuf(int pid, struct iovec* liov, struct iovec* riov, unsigned long riov_cnt)
+unsigned long handle_faulty_iov(int pid, struct iovec* riov, unsigned long faulty_index,
+				struct iovec *bufvec, struct iovec* aux_iov,
+				unsigned long* aux_len, unsigned long partial_read_bytes)
 {
-	ssize_t ret;
-
-	ret = process_vm_readv(pid, liov, 1, riov, riov_cnt, 0);
-
-	/* Target process doesn't exist */
-	if (ret == -1 && errno == ESRCH) {
-		pr_debug("Target process with PID %d not found\n", pid);
-		return PR_UNAVIL;
+	/* Handling Case 2*/
+	if (riov[faulty_index].iov_len == PAGE_SIZE) {
+		cnt_sub(CNT_PAGES_WRITTEN, 1);
+		return 0;
 	}
 
-	return ret;
-}
+	struct iovec dummy;
+	ssize_t bytes_read;
+	unsigned long offset = 0;
+	unsigned long final_read_cnt = 0;
 
-/*
- * This function returns the index of that iov in an iovec, which failed to get
- * processed by process_vm_readv or may be partially processed
- */
-static unsigned int faulty_iov_index(ssize_t bytes_read, struct iovec* riov, size_t index,
-		unsigned int riovcnt, unsigned long *iov_cntr, unsigned long *page_diff)
-{
-	ssize_t processed_bytes = 0;
-	*iov_cntr = 0;
-	*page_diff = 0;
+	/* Handling Case 3-Part 3.2*/
+	offset = (partial_read_bytes)? partial_read_bytes : PAGE_SIZE;
 
-	while (processed_bytes < bytes_read && index < riovcnt) {
+	dummy.iov_base = riov[faulty_index].iov_base + offset;
+	dummy.iov_len = riov[faulty_index].iov_len - offset;
 
-		processed_bytes += riov[index].iov_len;
-		(*iov_cntr) += 1;
-		index += 1;
-	}
+	if (!partial_read_bytes)
+		cnt_sub(CNT_PAGES_WRITTEN, 1);
 
-	/* one iov is partially read */
-	if (bytes_read < processed_bytes) {
-		*page_diff = processed_bytes - bytes_read;
-		index -= 1;
-	}
+	while (dummy.iov_len) {
 
-	return index;
-}
+		bytes_read = process_vm_readv(pid, bufvec, 1, &dummy, 1, 0);
 
-static long processing_ppb_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bufvec)
-{
-	struct iovec *riov = ppb->iov;
-	ssize_t bytes_read = 0;
-	unsigned long pro_iovs = 0, start = 0, iov_cntr = 0, end;
-	unsigned long pages_read = 0, pages_skipped = 0;
-	unsigned long page_diff = 0;
-
-	bufvec->iov_len = sizeof(userbuf);
-	bufvec->iov_base = userbuf;
-
-	while (pro_iovs < ppb->nr_segs) {
-
-		bytes_read = copy_to_userbuf(pid, bufvec, &riov[start],
-							ppb->nr_segs - pro_iovs);
-
-		if (bytes_read == PR_UNAVIL)
-			return PR_UNAVIL;
-
-		if (bytes_read == ER_READ) {
-			/*
-			 *  In other errors, adjust page count and mark the page
-			 *  to be skipped by pagemap generation
-			 */
-
-			cnt_sub(CNT_PAGES_WRITTEN, riov[start].iov_len/PAGE_SIZE);
-			pages_skipped += riov[start].iov_len/PAGE_SIZE;
-			riov[start].iov_base = SKIP_PAGEMAP;
-
-			pro_iovs += 1;
-			start += 1;
+		if(bytes_read == -1) {
+			/* Handling faulty page read in faulty iov */
+			cnt_sub(CNT_PAGES_WRITTEN, 1);
+			dummy.iov_base += PAGE_SIZE;
+			dummy.iov_len -= PAGE_SIZE;
 			continue;
 		}
 
-		pages_read += bytes_read/PAGE_SIZE;
-
-		if (pages_read + pages_skipped == ppb->pages_in)
-			break;
-
-		end = faulty_iov_index(bytes_read, riov,
-					start, ppb->nr_segs, &iov_cntr, &page_diff);
-
-		/*
-		 * One single iov could be partially read, unless unmapped page in
-		 * iov range is not hit by process_vm_readv, need to handle this
-		 * special case
-		 */
-
-		if (!page_diff) {
-			cnt_sub(CNT_PAGES_WRITTEN, riov[end].iov_len/PAGE_SIZE);
-			pages_skipped += riov[end].iov_len/PAGE_SIZE;
-			riov[end].iov_base = SKIP_PAGEMAP;
-			start = end + 1;
-			pro_iovs += iov_cntr + 1;
-		} else {
-			riov[end].iov_len -= page_diff;
-			cnt_sub(CNT_PAGES_WRITTEN, page_diff/PAGE_SIZE);
-			pages_skipped += page_diff/PAGE_SIZE;
-			start = end + 1;
-			pro_iovs += iov_cntr;
+		/* If aux-iov can merge and expand or new entry required */
+		if (aux_iov[(*aux_len)-1].iov_base +
+			aux_iov[(*aux_len)-1].iov_len == dummy.iov_base)
+			aux_iov[(*aux_len)-1].iov_len += bytes_read;
+		else {
+			aux_iov[*aux_len].iov_base = dummy.iov_base;
+			aux_iov[*aux_len].iov_len = bytes_read;
+			(*aux_len) += 1;
 		}
 
-		bufvec->iov_base = userbuf + pages_read * PAGE_SIZE;
+		dummy.iov_base += bytes_read;
+		dummy.iov_len -= bytes_read;
+		bufvec->iov_base += bytes_read;
 		bufvec->iov_len -= bytes_read;
+		final_read_cnt += bytes_read;
 	}
 
-	return pages_read;
+	return final_read_cnt;
 }
 
 
+/*
+ * This function will position start pointer to the latest
+ * successfully read iov in iovec. In case of partial read it
+ * returns partial_read_bytes, otherwise 0.
+ */
+static unsigned long analyze_iov(ssize_t bytes_read, struct iovec* riov,
+					unsigned long *index, struct iovec *aux_iov,
+					unsigned long *aux_len)
+{
+	ssize_t processed_bytes = 0;
+	unsigned long partial_read_bytes = 0;
+
+	/* correlating iovs with read bytes */
+	while (processed_bytes < bytes_read) {
+
+		processed_bytes += riov[*index].iov_len;
+		aux_iov[*aux_len].iov_base = riov[*index].iov_base;
+		aux_iov[*aux_len].iov_len = riov[*index].iov_len;
+
+		(*aux_len) += 1;
+		(*index) += 1;
+	}
+
+	/* handling partially processed faulty iov*/
+	if (processed_bytes - bytes_read) {
+
+		(*index) -= 1;
+
+		partial_read_bytes = riov[*index].iov_len
+					- (processed_bytes - bytes_read);
+		aux_iov[*aux_len-1].iov_len = partial_read_bytes;
+	}
+
+	return partial_read_bytes;
+}
+
+
+/*
+ * This function iterates over complete ppb->iov entries and passes them to
+ * process_vm_readv syscall.
+ *
+ * Since process_vm_readv returns count of successfully read bytes. It does
+ * not point to iovec entry associated to last successful byte read. We setup
+ * this correlation between bytes read and corresponding iovecs through
+ * analyze_iov function.
+ *
+ * If all iovecs are not processed in one go, it means there exists some
+ * faulty iov entry(memory mappings modified since it was grabbed) in iovec.
+ * process_vm_readv syscall stops at such faulty iov and don't process
+ * further any entry in iovec. This is handled by handle_faulty_iov function.
+ */
+static long fill_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bufvec,
+					struct iovec* aux_iov, unsigned long *aux_len)
+{
+	struct iovec *riov = ppb->iov;
+	ssize_t bytes_read;
+	unsigned long total_read = 0;
+	unsigned long start = 0;
+	unsigned long partial_read_bytes = 0;
+
+	while (start < ppb->nr_segs) {
+
+		bytes_read = process_vm_readv(pid, bufvec, 1, &riov[start],
+							ppb->nr_segs - start, 0);
+
+		if (bytes_read == -1) {
+			/* Handling Case 1*/
+			if (riov[start].iov_len == PAGE_SIZE) {
+				cnt_sub(CNT_PAGES_WRITTEN, 1);
+				start += 1;
+				continue;
+
+			} else if (errno == ESRCH) {
+                                pr_debug("Target process PID:%d not found\n", pid);
+                                return PR_UNAVIL;
+                        }
+		}
+
+		partial_read_bytes = 0;
+
+		if (bytes_read > 0) {
+
+			partial_read_bytes = analyze_iov(bytes_read, riov, &start,
+								aux_iov, aux_len);
+			bufvec->iov_base += bytes_read;
+			bufvec->iov_len -= bytes_read;
+			total_read += bytes_read;
+		}
+
+		/* If all iovs not processed in one go,
+		   it means some iov in between has failed */
+		if (start < ppb->nr_segs)
+			total_read += handle_faulty_iov(pid, riov, start, bufvec,
+						aux_iov, aux_len, partial_read_bytes);
+		start += 1;
+
+	}
+
+	return total_read;
+}
+
+
+/*
+ * This function is similar to page_xfer_dump_pages, instead it uses
+ * auxiliary_iov array for pagemap generation.
+ *
+ * The entries of ppb->iov may mismatch with actual process mappings
+ * present at time of memory dump. Such entries needs adjustment as per
+ * the pages read by process_vm_readv syscall. These adjusted entries
+ * along with unmodified entries are present in aux_iov array.
+ */
 int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0, i;
-	unsigned long ret, pages_read;
+	unsigned long ret, bytes_read;
 	struct iovec bufvec;
+
+	struct iovec aux_iov[PIPE_MAX_SIZE];
+	unsigned long aux_len;
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
 
 		timing_start(TIME_MEMDUMP);
-		pages_read = processing_ppb_userbuf(pid, ppb, &bufvec);
 
-		if (pages_read == ER_READ || pages_read == PR_UNAVIL)
+		aux_len = 0;
+		bufvec.iov_len = sizeof(userbuf);
+		bufvec.iov_base = userbuf;
+
+		bytes_read = fill_userbuf(pid, ppb, &bufvec, aux_iov, &aux_len);
+
+		if (bytes_read == PR_UNAVIL)
 			return -1;
 
 		bufvec.iov_base = userbuf;
-		bufvec.iov_len = pages_read * PAGE_SIZE;
+		bufvec.iov_len = bytes_read;
 		ret = vmsplice(ppb->p[1], &bufvec, 1, SPLICE_F_NONBLOCK);
 
-		if (ret == -1 || ret != pages_read * PAGE_SIZE) {
+		if (ret == -1 || ret != bytes_read) {
 			pr_err("vmsplice: Failed to splice user buffer to pipe %ld\n", ret);
 			return -1;
 		}
@@ -640,13 +842,11 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 		timing_stop(TIME_MEMDUMP);
 
 		timing_start(TIME_MEMWRITE);
+
 		/* generating pagemap */
-		for (i = 0; i < ppb->nr_segs; i++) {
+		for (i = 0; i < aux_len; i++) {
 
-			if (ppb->iov[i].iov_base == SKIP_PAGEMAP)
-				continue;
-
-			struct iovec iov = ppb->iov[i];
+			struct iovec iov = aux_iov[i];
 			u32 flags;
 
 			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
@@ -655,7 +855,7 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
 
 			BUG_ON(iov.iov_base < (void *)xfer->offset);
 			iov.iov_base -= xfer->offset;
-			pr_debug("\tp %p [%u]\n", iov.iov_base,
+			pr_debug("\t p %p [%u]\n", iov.iov_base,
 					(unsigned int)(iov.iov_len / PAGE_SIZE));
 
 			flags = ppb_xfer_flags(xfer, ppb);
