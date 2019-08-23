@@ -1515,7 +1515,11 @@ static int cr_pre_dump_finish(int status)
 		mem_pp = dmpi(item)->mem_pp;
 		timing_stop(TIME_MEMWRITE);
 
-		ret = page_xfer_predump_pages(item->pid->real, &xfer, mem_pp);
+		if (opts.pre_dump_mode == PRE_DUMP_READ)
+			ret = page_xfer_predump_pages(item->pid->real,
+							&xfer, mem_pp);
+		else
+			ret = page_xfer_dump_pages(&xfer, mem_pp);
 
 		xfer.close(&xfer);
 

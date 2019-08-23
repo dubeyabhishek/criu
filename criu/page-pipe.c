@@ -33,11 +33,21 @@ static int __ppb_resize_pipe(struct page_pipe_buf *ppb, unsigned long new_size)
 {
 	int ret;
 
-	ret = fcntl(ppb->p[0], F_SETPIPE_SZ, new_size * PAGE_SIZE + 1);
+	ret = fcntl(ppb->p[0], F_SETPIPE_SZ, new_size * PAGE_SIZE);
 	if (ret < 0)
 		return -1;
 
 	ret /= PAGE_SIZE;
+
+	/*
+	 * Sometimes vmsplice fails to splice N pages(where N=2^k) from
+	 * user buffer to pipe, so restricting page-pipe capacity to
+	 * accommodate N-1 pages.
+	 * e.g. Pipe size can be 512 pages, but it's filled till 511 pages.
+	 */
+	if (opts.pre_dump_mode == PRE_DUMP_READ)
+		ret -= 1;
+
 	BUG_ON(ret < ppb->pipe_size);
 
 	pr_debug("Grow pipe %x -> %x\n", ppb->pipe_size, ret);

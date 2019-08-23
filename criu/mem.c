@@ -361,10 +361,17 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma,
 				!vma_area_is(vma, VMA_ANON_SHARED))
 		return 0;
 
-	if (!(vma->e->prot & PROT_READ)) {
+	/*
+	 * process_vm_readv syscall can't copy memory regions lacking PROT_READ
+	 * flag. Therefore, avoid generating iovs for such regions in "read"
+	 * mode pre-dump. Regions skipped by pre-dumps can't be referred as parent
+	 * by following dump stage. So, mark "has_parent=false" for such regions. 
+	 */
+	if (opts.pre_dump_mode == PRE_DUMP_READ && !(vma->e->prot & PROT_READ)) {
 		if (pre_dump)
 			return 0;
-		has_parent = false;
+		if (!pre_dump)
+			has_parent = false;
 	}
 
 	if (vma_entry_is(vma->e, VMA_AREA_AIORING)) {
@@ -495,7 +502,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item,
 	 * actual optimization which reduces time for which process was frozen
 	 * during pre-dump.
 	 */
-	if (mdc->pre_dump)
+	if (mdc->pre_dump && opts.pre_dump_mode == PRE_DUMP_READ)
 		ret = 0;
 	else
 		ret = drain_pages(pp, ctl, args);
@@ -547,7 +554,7 @@ int parasite_dump_pages_seized(struct pstree_item *item,
 	 * Afterwards -- reprotect memory back.
 	 */
 
-	if (!mdc->pre_dump) {
+	if (!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) {
 		pargs->add_prot = PROT_READ;
 		ret = compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl);
 		if (ret) {
@@ -568,7 +575,7 @@ int parasite_dump_pages_seized(struct pstree_item *item,
 		return ret;
 	}
 
-	if (!mdc->pre_dump) {
+	if (!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) {
 		pargs->add_prot = 0;
 		if (compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
 			pr_err("Can't rollback unprotected vmas with parasite\n");
